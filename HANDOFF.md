@@ -9,14 +9,23 @@ Broader context in memory: `grf-rust-liftover-plan.md`, `cnn-phase-profiling-pla
 
 ## Current status
 - **Port is byte-identical** to stock-detection + real `grf-filter` on 3 contigs
-  (512 kbp samples): 8854 / 6682 / 6289 candidates.
+  (512 kbp samples): 8854 / 6682 / 6289 candidates. Now under git (`main` = safe baseline).
 - `seqComplexity` = hand-rolled **suffix automaton** LZ76 (O(n), exact same count).
-- Done so far (all diff-validated identical): hand-rolled homopolymer filter (== the C++
-  regex), early-exit + integer `c_thresh` (now inside the SAM), `target-cpu=native`,
-  bounds-check elision on the scan (`zip`), `getStem` `left`/`pos` to a reused thread-local.
-- **Perf (512 kbp sample, single-thread):** rust **~28.0 s** vs C++ patched `-t1` **20.7 s**.
-  The bounds-check + alloc fixes gave only ~2% (28.5→28.0) → those weren't the bottleneck.
-  **Not done with single thread.** Next is instrument + the algorithmic scan (below).
+- **Perf (512 kbp sample, single-thread): ~27 s → ~4.3 s (~6.4×)**, vs C++ patched `-t1`
+  **20.7 s** (so now ~4.8× faster than C++). All steps diff-validated byte-identical.
+  Optimization journey (see `docs/PROFILING.md` for the supporting profile):
+  1. **2-bit exact seed code** (commit `0800278`): the seed match was a lossy `abs_sum`
+     skew proxy (~20% false-pass) over all 2.5e9 pairs + a byte two-pointer re-verify
+     (~22 s). Replaced with precomputed `fcode`/`gcode` and an XOR + popcount test.
+     `abs_sum` dropped entirely. ~27 s → ~11.4 s.
+  2. **Code-keyed join** (commit `45a6085`): the O(1) test still visited all 2.5e9 pairs
+     (~6.7 s). Replaced with a CSR index (fcode → ascending start list); per `end` look up
+     the 1+3·(seed−1) neighbor codes of `gcode[end]` within the spacer window. Visits
+     ~matches, not all pairs. ~11.4 s → ~4.3 s.
+- **Next target:** `filter_low_complex` (gc / regex / `seqComplexity`) — now the dominant
+  remaining cost (~3 s) since the scan collapsed. Then SIMD/parallel/PyO3 as before.
+- Earlier micro-opts (still in place, were ~2%): homopolymer filter == C++ regex, integer
+  `c_thresh` early-exit in the SAM, `target-cpu=native`, `getStem` reused thread-local.
 
 ## Key locations
 - Rust port:            `~/tirlearner_test/grf_rs/`  (all logic in `src/main.rs`)
@@ -85,22 +94,25 @@ validate() { local chunk=$1 tag=$2
 ```
 
 ## NEXT STEPS (algorithmic first)
-1. **Instrument** to localize the ~28 s (1+2 was marginal → bottleneck is elsewhere).
-   Stub probes: `seq_complexity`→1.0 isolates SAM (~4.6 s); short-circuit the candidate
-   path (skip getStem/tsd/filter on absSum pass) isolates the scan.
-2. **Algorithmic scan (the high-level win, do BEFORE SIMD).** Replace the brute-force
-   O(n × spacer_range=4990) absSum scan with an **inverted index on S_TR values**:
-   group positions by their `(i16,i16)` score (~221 distinct for clean DNA); for each `j`,
-   look up positions `k` whose `S_TR[k]` is within L1-ball radius 2 of `-S_TR[j]`
-   (~13 target values) AND `k-j ∈ [seed+min_space, seed+max_space]` (window). Emits exactly
-   the absSum-passing pairs. Loop `j` outer to keep per-spacer j-order → same output.
-   Likely ~20–50× vs SIMD's ~4–8× on the brute force. SAME-RESULTS (diff-validate).
-3. **SAM array transitions** (5-symbol ACGTN alphabet) + **buffer reuse** → reclaim ~4.6 s.
-4. **`getStem` 2-bit** (2-bit enc: complement = bitwise-NOT, so isPair ⟺ `enc(a)^enc(b)==0b11`;
-   pre-encode the chunk ONCE + operate on views; N validity mask). Same-results, diff vs byte-wise.
-5. Only THEN low-level: SoA/SIMD on whatever hot loop remains.
-6. Only THEN parallel: rayon over the spacer loop (was reverted — single-thread first),
+DONE: instrument (localized ~22 s to seed verification, not abs_sum), 2-bit exact code
+test (commit `0800278`), code-keyed join (commit `45a6085`). See `docs/PROFILING.md`.
+The old "inverted index on S_TR" plan was WRONG — it targeted the ~1–2 s abs_sum
+arithmetic, but the wall was the byte seed-verification downstream of it; the correct key
+is the **2-bit seed code**, not S_TR. That is now built (the join).
+
+1. **`filter_low_complex` (now the dominant ~3 s).** Runs on candidate survivors: gc_content,
+   homopolymer/dinuc regex, and `seqComplexity` (suffix-automaton LZ76). Re-profile to split
+   these three, then attack — likely the SAM build (per-candidate `HashMap` allocs) is the
+   bulk; array transitions (5-symbol ACGTN) + buffer reuse should reclaim most.
+2. **`get_stem` 2-bit** (~0.8 s): complement = bitwise-NOT, isPair ⟺ `enc(a)^enc(b)==0b11`;
+   reuse the already-built `fcode`-style encoding instead of byte `is_pair`.
+3. Only THEN low-level: SoA/SIMD on whatever hot loop remains.
+4. Only THEN parallel: rayon over the spacer loop (was reverted — single-thread first),
    then PyO3 + fragment-aware orchestrator (dedup falls out structurally).
+
+OPEN QUESTION (scale): the join only touches *matches*, so `abs_sum` as a pre-filter looks
+moot. The real scale risk is giant `fcode` buckets in repetitive genomes inflating the
+match count / downstream cost — watch at full-genome scale (per-bucket-size distribution).
 
 ## GOTCHAS / learnings (don't re-discover)
 - **grf-filter sidecar**: stock `grf-main`'s `filterByLen` shells out to a separate
