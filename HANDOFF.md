@@ -95,20 +95,31 @@ validate() { local chunk=$1 tag=$2
 
 ## NEXT STEPS (algorithmic first)
 DONE: instrument (localized ~22 s to seed verification, not abs_sum), 2-bit exact code
-test (commit `0800278`), code-keyed join (commit `45a6085`). See `docs/PROFILING.md`.
-The old "inverted index on S_TR" plan was WRONG — it targeted the ~1–2 s abs_sum
-arithmetic, but the wall was the byte seed-verification downstream of it; the correct key
-is the **2-bit seed code**, not S_TR. That is now built (the join).
+test (`0800278`), code-keyed join (`45a6085`), seq_complexity array-SAM (`8305103`).
+512 kbp sample: ~27 s → ~1.57 s (~17×). See `docs/PROFILING.md`. Final per-stage split:
+get_stem ~0.81 s, seq_complexity residual ~0.49 s, scan ~0.19 s, build ~0.07 s, rest noise.
+The old "inverted index on S_TR" plan was WRONG (it targeted the ~1–2 s abs_sum arithmetic);
+correct key is the **2-bit seed code**, now the join.
 
-1. **`filter_low_complex` (now the dominant ~3 s).** Runs on candidate survivors: gc_content,
-   homopolymer/dinuc regex, and `seqComplexity` (suffix-automaton LZ76). Re-profile to split
-   these three, then attack — likely the SAM build (per-candidate `HashMap` allocs) is the
-   bulk; array transitions (5-symbol ACGTN) + buffer reuse should reclaim most.
-2. **`get_stem` 2-bit** (~0.8 s): complement = bitwise-NOT, isPair ⟺ `enc(a)^enc(b)==0b11`;
-   reuse the already-built `fcode`-style encoding instead of byte `is_pair`.
-3. Only THEN low-level: SoA/SIMD on whatever hot loop remains.
-4. Only THEN parallel: rayon over the spacer loop (was reverted — single-thread first),
-   then PyO3 + fragment-aware orchestrator (dedup falls out structurally).
+1. **`get_stem` via 2-bit encoding (IN PROGRESS).** isPair ⟺ `enc(a)^enc(b)==0b11`; precompute
+   a per-base `enc` array (ACGT→0..3, non-ACGT→4 sentinel so xor can never ==3) and pair via
+   `enc[start+i]^enc[end-i]==3` instead of byte `is_pair`. **Keep the cigar byte-identical**
+   for now → this stays the scale-validation platform. Then the surgery below.
+2. **DEFERRED CIGAR SURGERY (pinned 2026-06-05; TIR-Learner-bespoke, NOT byte-identical).**
+   TIR-Learner uses the GRF cigar ONLY via `grf_new.py parse_cig` = sum of its digit-runs =
+   the TIR arm length; the m/M *structure* is never used (it re-aligns TIRs itself with WFA,
+   then records tir1=tir2=that length, which drives the CNN element split). So drop the RLE
+   string entirely: `get_stem` returns the **integer** `min(pos[idx], len2)` (the clamped arm
+   length = exactly what `parse_cig` returns today — NOT raw `pos[idx]`/`tr1`, due to the
+   substr-clamp edge case), and the header emits that integer directly. Removes `compress()` +
+   the m/M `left` buffer. Validation flips from byte-identity to **TIR-Learner-equivalence**:
+   per candidate, emitted int == sum-of-digits(REF cigar) AND coords/tsd/sequence identical,
+   same candidate count. (`parse_cig`+`cig` live only at grf_new.py:33,143,171; candidate.fasta
+   is consumed in one_GRF then deleted — nothing else sees the cigar.)
+3. **`seq_complexity` residual (~0.49 s)** if more single-thread is wanted.
+4. Only THEN low-level: SoA/SIMD on whatever hot loop remains (get_stem pairing vectorizes
+   if one arm is reverse-complement-encoded).
+5. Only THEN parallel: rayon over contigs/spacers + PyO3 fragment-aware orchestrator.
 
 OPEN QUESTION (scale): the join only touches *matches*, so `abs_sum` as a pre-filter looks
 moot. The real scale risk is giant `fcode` buckets in repetitive genomes inflating the
