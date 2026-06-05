@@ -5,3 +5,4 @@ edition = "2024"
 
 [dependencies]
 needletail = "0.7.3"
+rayon = "1"

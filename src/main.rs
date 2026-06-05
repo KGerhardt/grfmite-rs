@@ -1,6 +1,7 @@
 // Direct Rust port of GRF grf-main `-c 1` (MITE) detection, aiming for byte-identical
 // candidate.fasta vs stock grf-main. Correctness first (byte-wise); 2-bit/SIMD later.
 use needletail::parse_fastx_file;
+use rayon::prelude::*;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 
@@ -20,13 +21,14 @@ struct Param {
     max_spacer_len: i32,
     emit_cigar: bool, // --rle-cigar: emit stock GRF RLE cigar (byte-identical, general-tool);
                       // default false = emit the integer TIR arm length (TIR-Learner use-case)
+    threads: usize,   // -t: intra-file parallelism over the end-loop (1 = serial)
 }
 impl Default for Param {
     fn default() -> Self {
         Param { seed: 10, seed_mismatch: 1, min_stem: 0, max_stem: i32::MAX, percent: 10,
                 min_space: -1, max_space: -1, min_tsd: 2, max_tsd: 10,
                 max_mismatch: i32::MAX, min_spacer_len: 0, max_spacer_len: i32::MAX,
-                emit_cigar: false }
+                emit_cigar: false, threads: 1 }
     }
 }
 
@@ -267,17 +269,19 @@ fn filter_low_complex(seq: &[u8], arm: usize, a2c: &[u8; 256], alpha: usize) -> 
 //
 // Iterating `end` ascending makes each spacer bucket fill in ascending `start` order
 // (start = end - off2 for that spacer), so output stays byte-identical to the old scan.
-fn join_detect(gcode: &[u32], offsets: &[u32], starts_by_code: &[u32],
-               seq: &[u8], enc: &[u8], p: &Param, spacer_vecs: &mut [Vec<Mite>],
-               a2c: &[u8; 256], alpha: usize) {
+//
+// Process one contiguous end-range [end_lo, end_hi) -> flat Vec<Mite> (end-ascending).
+// Pure read of the immutable index/codes, so ranges run independently (rayon).
+#[allow(clippy::too_many_arguments)]
+fn detect_range(end_lo: usize, end_hi: usize, gcode: &[u32], offsets: &[u32],
+                starts_by_code: &[u32], seq: &[u8], enc: &[u8], p: &Param,
+                a2c: &[u8; 256], alpha: usize) -> Vec<Mite> {
     let seed = p.seed as usize;
-    let n = seq.len();
     let min_off2 = (p.min_space + 2 * p.seed - 1) as usize; // end - start at min spacer
     let max_off2 = (p.max_space + 2 * p.seed - 1) as usize; // end - start at max spacer
-    let twoseed_m1 = (2 * p.seed - 1) as usize;
-    let min_space = p.min_space as usize;
+    let mut out: Vec<Mite> = Vec::new();
     let mut codes: Vec<u32> = Vec::with_capacity(1 + 3 * (seed - 1));
-    for end in min_off2..n {
+    for end in end_lo.max(min_off2)..end_hi {
         let g = gcode[end];
         if g == INVALID { continue; }
         let hi = end - min_off2; // start <= hi  (i_sp >= min_space)
@@ -298,7 +302,6 @@ fn join_detect(gcode: &[u32], offsets: &[u32], starts_by_code: &[u32],
                 let start = st as usize;
                 if start > hi { break; }
                 let l = end - start + 1; // = i_sp + 2*seed
-                let i_sp = end - start - twoseed_m1; // in [min_space, max_space]
                 let cand = &seq[start..start + l];
                 let tsd = detect_tsd(seq, start, end, p.min_tsd, p.max_tsd);
                 if tsd.is_empty() { continue; }
@@ -310,11 +313,42 @@ fn join_detect(gcode: &[u32], offsets: &[u32], starts_by_code: &[u32],
                 };
                 if let Some((arm, cigar)) = stem {
                     if filter_low_complex(cand, arm as usize, a2c, alpha) {
-                        spacer_vecs[i_sp - min_space].push(Mite { start, end, arm, tsd, cigar });
+                        out.push(Mite { start, end, arm, tsd, cigar });
                     }
                 }
             }
         }
+    }
+    out
+}
+
+// Driver: run detect_range over the contig, serial or rayon over fixed end-chunks.
+// In-order `collect` keeps the flattened Mites end-ascending, so distributing them into
+// per-spacer bins reproduces the serial start-ascending order -> byte-identical either way.
+#[allow(clippy::too_many_arguments)]
+fn join_detect(gcode: &[u32], offsets: &[u32], starts_by_code: &[u32],
+               seq: &[u8], enc: &[u8], p: &Param, spacer_vecs: &mut [Vec<Mite>],
+               a2c: &[u8; 256], alpha: usize) {
+    let n = seq.len();
+    let min_off2 = (p.min_space + 2 * p.seed - 1) as usize;
+    let min_space = p.min_space as usize;
+    let twoseed_m1 = (2 * p.seed - 1) as usize;
+    let total = n.saturating_sub(min_off2);
+    const CHUNK: usize = 16384; // ends per task; fine enough to spread dense regions
+    let mites: Vec<Mite> = if p.threads <= 1 || total <= CHUNK {
+        detect_range(min_off2, n, gcode, offsets, starts_by_code, seq, enc, p, a2c, alpha)
+    } else {
+        let nchunks = total.div_ceil(CHUNK);
+        let parts: Vec<Vec<Mite>> = (0..nchunks).into_par_iter().map(|ci| {
+            let lo = min_off2 + ci * CHUNK;
+            let hi = (lo + CHUNK).min(n);
+            detect_range(lo, hi, gcode, offsets, starts_by_code, seq, enc, p, a2c, alpha)
+        }).collect();
+        parts.into_iter().flatten().collect()
+    };
+    for m in mites {
+        let i_sp = m.end - m.start - twoseed_m1;
+        spacer_vecs[i_sp - min_space].push(m);
     }
 }
 
@@ -330,7 +364,7 @@ fn main() {
             "-i" => input = val(&mut k),
             "-o" => outdir = val(&mut k),
             "-c" => { val(&mut k); }
-            "-t" => { val(&mut k); }
+            "-t" => p.threads = val(&mut k).parse().unwrap_or(1).max(1),
             "-p" => p.percent = val(&mut k).parse().unwrap(),
             "-s" => p.seed = val(&mut k).parse().unwrap(),
             "--seed_mismatch" => p.seed_mismatch = val(&mut k).parse().unwrap(),
@@ -346,6 +380,10 @@ fn main() {
             _ => {}
         }
         k += 1;
+    }
+
+    if p.threads > 1 {
+        rayon::ThreadPoolBuilder::new().num_threads(p.threads).build_global().ok();
     }
 
     // read fasta (uppercased); chrom name = first whitespace token of the header
