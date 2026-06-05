@@ -34,6 +34,13 @@ fn is_pair(a: u8, b: u8) -> bool {
     matches!((a, b), (b'A', b'T') | (b'C', b'G') | (b'G', b'C') | (b'T', b'A'))
 }
 
+// 2-bit base code with complement == XOR 0b11 (A=00 C=01 G=10 T=11); None = non-ACGT.
+#[inline]
+fn code(b: u8) -> Option<u32> {
+    match b { b'A' => Some(0), b'C' => Some(1), b'G' => Some(2), b'T' => Some(3), _ => None }
+}
+const INVALID: u32 = u32::MAX; // sentinel: seed window contains a non-ACGT base
+
 // run-length encode an m/M byte string -> e.g. "3m2M"
 fn compress(s: &[u8]) -> String {
     if s.is_empty() { return String::new(); }
@@ -217,25 +224,27 @@ fn filter_low_complex(seq: &[u8], tir: &str) -> bool {
     true
 }
 
-fn detect_str(i_sp: i32, s_tr: &[(i32, i32)], seq: &[u8], p: &Param, v: &mut Vec<Mite>) {
+// Exact seed match via precomputed 2-bit codes (replaces the abs_sum skew proxy + byte
+// two-pointer loop). fcode[start] = forward window code; gcode[end] = RC-window code, so
+// field k of (fcode[start] ^ gcode[end]) is zero iff seq[start+k] pairs with seq[end-k].
+// Requirement (byte-identical to is_pair k=0 + unpair loop): field 0 must match exactly,
+// and <= seed_mismatch fields differ overall (field 0 already 0, so that's fields 1..seed).
+fn detect_str(i_sp: i32, fcode: &[u32], gcode: &[u32], seq: &[u8], p: &Param, v: &mut Vec<Mite>) {
     let seed = p.seed;
-    let num_i = s_tr.len() as i64 - i_sp as i64 - seed as i64;
+    let num_i = fcode.len() as i64 - i_sp as i64 - seed as i64;
     if num_i <= 0 { return; }
     let num = num_i as usize;
     let l = (i_sp + 2 * seed) as usize;
-    let max_abs = p.seed_mismatch * 2;
-    let off = (seed + i_sp) as usize;
-    // zip elides bounds checks on the 2.5e9 hot path (off+num == s_tr.len())
-    for (j, (a, b)) in s_tr[..num].iter().zip(&s_tr[off..]).enumerate() {
-        let abs_sum = (a.0 + b.0).abs() + (a.1 + b.1).abs();
-        if abs_sum > max_abs { continue; }
+    let off2 = l - 1; // end = start + off2; gcode[off2..off2+num] == gcode[off2..gcode.len()]
+    let mask_low: u32 = 0x5555_5555 & ((1u32 << (2 * seed)) - 1); // low bit of each 2-bit field
+    // zip elides bounds checks on the 2.5e9 hot path (off2 + num == gcode.len())
+    for (j, (&fj, &gend)) in fcode[..num].iter().zip(&gcode[off2..]).enumerate() {
+        if fj == INVALID || gend == INVALID { continue; }
+        let xor = fj ^ gend;
+        if xor & 0b11 != 0 { continue; } // k=0 (outermost pair) must match exactly
+        let mism = ((xor | (xor >> 1)) & mask_low).count_ones() as i32;
+        if mism > p.seed_mismatch { continue; }
         let (start, end) = (j, j + l - 1);
-        if !is_pair(seq[start], seq[end]) { continue; }
-        let mut unpair = 0i32;
-        for k in 1..seed as usize {
-            if !is_pair(seq[start + k], seq[end - k]) { unpair += 1; }
-        }
-        if unpair > p.seed_mismatch { continue; }
         let cand = &seq[start..start + l];
         let tsd = detect_tsd(seq, start, end, p.min_tsd, p.max_tsd);
         if tsd.is_empty() { continue; }
@@ -294,20 +303,29 @@ fn main() {
         let seed = p.seed as usize;
         let mut spacer_vecs: Vec<Vec<Mite>> = (0..nspace).map(|_| Vec::new()).collect();
         if n >= (2 * p.seed + p.max_space + 2 * p.max_tsd) as usize {
-            let mut cum: Vec<(i32, i32)> = Vec::with_capacity(n);
-            let (mut a, mut b) = (0i32, 0i32);
-            for &ch in seq {
-                let (x, y) = match ch { b'A' => (1, 0), b'C' => (0, 1), b'G' => (0, -1), b'T' => (-1, 0), _ => (100, 0) };
-                a += x; b += y;
-                cum.push((a, b));
+            // fcode[p] = forward 2-bit code of window [p, p+seed); INVALID if it has a non-ACGT.
+            let mut fcode: Vec<u32> = vec![INVALID; n - seed + 1];
+            for p_ in 0..=n - seed {
+                let mut val = 0u32;
+                let mut ok = true;
+                for k in 0..seed {
+                    match code(seq[p_ + k]) { Some(c) => val |= c << (2 * k), None => { ok = false; break; } }
+                }
+                if ok { fcode[p_] = val; }
             }
-            let mut s_tr: Vec<(i32, i32)> = vec![(0, 0); n - seed + 1];
-            s_tr[0] = cum[seed - 1];
-            for i in seed..n {
-                s_tr[i - seed + 1] = (cum[i].0 - cum[i - seed].0, cum[i].1 - cum[i - seed].1);
+            // gcode[end] = RC code of window [end-seed+1, end] = complement of each base, reversed,
+            // so field k = comp(code(seq[end-k])). INVALID for end < seed-1 or any non-ACGT.
+            let mut gcode: Vec<u32> = vec![INVALID; n];
+            for end in (seed - 1)..n {
+                let mut val = 0u32;
+                let mut ok = true;
+                for k in 0..seed {
+                    match code(seq[end - k]) { Some(c) => val |= (c ^ 0b11) << (2 * k), None => { ok = false; break; } }
+                }
+                if ok { gcode[end] = val; }
             }
             for i_sp in p.min_space..=p.max_space {
-                detect_str(i_sp, &s_tr, seq, &p, &mut spacer_vecs[(i_sp - p.min_space) as usize]);
+                detect_str(i_sp, &fcode, &gcode, seq, &p, &mut spacer_vecs[(i_sp - p.min_space) as usize]);
             }
         }
         candidates.push(spacer_vecs);
