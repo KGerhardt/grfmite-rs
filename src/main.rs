@@ -91,71 +91,82 @@ fn low_complex_regex(s: &[u8]) -> bool {
     false
 }
 
+const SNONE: u32 = u32::MAX; // suffix-automaton "no transition" sentinel
+
 // LZ76 complexity via a suffix automaton (O(n)), same result as the stock O(n^2) find().
 // Build the SAM of seq tracking firstpos (first-occurrence END pos) per state; a factor
 // extends while seq[send..=i] occurs earlier (firstpos < i) and commits otherwise.
-fn seq_complexity(seq: &[u8]) -> f64 {
-    use std::collections::HashMap;
+// Transitions are a flat [state*alpha + code] table (a2c maps a byte to a dense code over
+// the genome's actual alphabet) instead of per-state HashMaps, and the SAM buffers are
+// reused across candidates via thread-local scratch — same SAM, no per-candidate alloc/hash.
+fn seq_complexity(seq: &[u8], a2c: &[u8; 256], alpha: usize) -> f64 {
     let n = seq.len();
     let denom = n as f64 / ((n as f64).ln() / 4f64.ln());
     let c_thresh = (0.675 * denom).ceil() as u32;
-    // ---- online suffix automaton with firstpos ----
-    let mut len: Vec<i32> = vec![0];
-    let mut link: Vec<i32> = vec![-1];
-    let mut next: Vec<HashMap<u8, u32>> = vec![HashMap::new()];
-    let mut firstpos: Vec<i32> = vec![-1];
-    let mut last = 0usize;
-    for (pos, &ch) in seq.iter().enumerate() {
-        let cur = len.len();
-        len.push(len[last] + 1);
-        link.push(-1);
-        next.push(HashMap::new());
-        firstpos.push(pos as i32);
-        let mut p = last as i32;
-        while p != -1 && !next[p as usize].contains_key(&ch) {
-            next[p as usize].insert(ch, cur as u32);
-            p = link[p as usize];
-        }
-        if p == -1 {
-            link[cur] = 0;
-        } else {
-            let q = next[p as usize][&ch] as usize;
-            if len[p as usize] + 1 == len[q] {
-                link[cur] = q as i32;
+    thread_local! {
+        // (len, link, firstpos, trans)
+        static SAM: std::cell::RefCell<(Vec<i32>, Vec<i32>, Vec<i32>, Vec<u32>)> =
+            std::cell::RefCell::new((Vec::new(), Vec::new(), Vec::new(), Vec::new()));
+    }
+    SAM.with(|cell| {
+        let mut b = cell.borrow_mut();
+        let (len, link, firstpos, trans) = &mut *b;
+        len.clear(); link.clear(); firstpos.clear(); trans.clear();
+        // state 0 = init. Invariant: after creating state s, trans.len() == (s+1)*alpha.
+        len.push(0); link.push(-1); firstpos.push(-1);
+        trans.resize(alpha, SNONE);
+        let mut last = 0usize;
+        for (pos, &ch) in seq.iter().enumerate() {
+            let c = a2c[ch as usize] as usize;
+            let cur = len.len();
+            len.push(len[last] + 1);
+            link.push(-1);
+            firstpos.push(pos as i32);
+            trans.resize((cur + 1) * alpha, SNONE);
+            let mut p = last as i32;
+            while p != -1 && trans[p as usize * alpha + c] == SNONE {
+                trans[p as usize * alpha + c] = cur as u32;
+                p = link[p as usize];
+            }
+            if p == -1 {
+                link[cur] = 0;
             } else {
-                let clone = len.len();
-                len.push(len[p as usize] + 1);
-                link.push(link[q]);
-                next.push(next[q].clone());
-                firstpos.push(firstpos[q]); // clone keeps q's first occurrence
-                while p != -1 && next[p as usize].get(&ch) == Some(&(q as u32)) {
-                    next[p as usize].insert(ch, clone as u32);
-                    p = link[p as usize];
+                let q = trans[p as usize * alpha + c] as usize;
+                if len[p as usize] + 1 == len[q] {
+                    link[cur] = q as i32;
+                } else {
+                    let clone = len.len();
+                    len.push(len[p as usize] + 1);
+                    link.push(link[q]);
+                    firstpos.push(firstpos[q]); // clone keeps q's first occurrence
+                    trans.extend_from_within(q * alpha..q * alpha + alpha); // copy q's edges
+                    while p != -1 && trans[p as usize * alpha + c] == q as u32 {
+                        trans[p as usize * alpha + c] = clone as u32;
+                        p = link[p as usize];
+                    }
+                    link[q] = clone as i32;
+                    link[cur] = clone as i32;
                 }
-                link[q] = clone as i32;
-                link[cur] = clone as i32;
+            }
+            last = cur;
+        }
+        // ---- LZ76 factorization ----
+        let mut c: u32 = 1;
+        let mut state = 0usize; // init state
+        for i in 1..n {
+            let t = trans[state * alpha + a2c[seq[i] as usize] as usize];
+            let ext = if t != SNONE && (firstpos[t as usize] as usize) < i { Some(t as usize) } else { None };
+            match ext {
+                Some(nxt) => state = nxt,
+                None => {
+                    c += 1;
+                    if c >= c_thresh { return c as f64 / denom; }
+                    state = 0;
+                }
             }
         }
-        last = cur;
-    }
-    // ---- LZ76 factorization ----
-    let mut c: u32 = 1;
-    let mut cur = 0usize; // init state
-    for i in 1..n {
-        let ext = match next[cur].get(&seq[i]) {
-            Some(&nxt) if (firstpos[nxt as usize] as usize) < i => Some(nxt as usize),
-            _ => None,
-        };
-        match ext {
-            Some(nxt) => cur = nxt,
-            None => {
-                c += 1;
-                if c >= c_thresh { return c as f64 / denom; }
-                cur = 0;
-            }
-        }
-    }
-    c as f64 / denom
+        c as f64 / denom
+    })
 }
 
 fn detect_tsd(seq: &[u8], start: usize, end: usize, min: i32, max: i32) -> String {
@@ -211,7 +222,7 @@ fn get_stem(s: &[u8], p: &Param) -> (String, u32, u32) {
     })
 }
 
-fn filter_low_complex(seq: &[u8], tir: &str) -> bool {
+fn filter_low_complex(seq: &[u8], tir: &str, a2c: &[u8; 256], alpha: usize) -> bool {
     let len1 = get_stem_len(tir, 'D') as usize;
     let len2 = get_stem_len(tir, 'I') as usize;
     let l = &seq[0..len1];
@@ -220,7 +231,7 @@ fn filter_low_complex(seq: &[u8], tir: &str) -> bool {
     let gc2 = gc_content(r) as f64;
     if gc1 < 0.2 || gc1 > 0.8 || gc2 < 0.2 || gc2 > 0.8 { return false; }
     if low_complex_regex(l) || low_complex_regex(r) { return false; }
-    if seq_complexity(seq) < 0.675 { return false; }
+    if seq_complexity(seq, a2c, alpha) < 0.675 { return false; }
     true
 }
 
@@ -237,7 +248,8 @@ fn filter_low_complex(seq: &[u8], tir: &str) -> bool {
 // Iterating `end` ascending makes each spacer bucket fill in ascending `start` order
 // (start = end - off2 for that spacer), so output stays byte-identical to the old scan.
 fn join_detect(gcode: &[u32], offsets: &[u32], starts_by_code: &[u32],
-               seq: &[u8], p: &Param, spacer_vecs: &mut [Vec<Mite>]) {
+               seq: &[u8], p: &Param, spacer_vecs: &mut [Vec<Mite>],
+               a2c: &[u8; 256], alpha: usize) {
     let seed = p.seed as usize;
     let n = seq.len();
     let min_off2 = (p.min_space + 2 * p.seed - 1) as usize; // end - start at min spacer
@@ -271,7 +283,7 @@ fn join_detect(gcode: &[u32], offsets: &[u32], starts_by_code: &[u32],
                 let tsd = detect_tsd(seq, start, end, p.min_tsd, p.max_tsd);
                 if tsd.is_empty() { continue; }
                 let (cigar, tr1, tr2) = get_stem(cand, p); // max_indel == 0
-                if !cigar.is_empty() && filter_low_complex(cand, &cigar) {
+                if !cigar.is_empty() && filter_low_complex(cand, &cigar, a2c, alpha) {
                     spacer_vecs[i_sp - min_space].push(Mite { start, end, tr1, tr2, tsd, tir: cigar });
                 }
             }
@@ -320,6 +332,17 @@ fn main() {
         seqs.push(rec.seq().iter().map(|b| b.to_ascii_uppercase()).collect());
     }
 
+    // Dense byte->code map over the genome's actual alphabet (injective on every byte that
+    // appears -> seq_complexity's array transitions are byte-identical to the HashMap version).
+    let mut a2c = [0u8; 256];
+    let mut alpha = 0usize;
+    {
+        let mut present = [false; 256];
+        for s in &seqs { for &bb in s { present[bb as usize] = true; } }
+        for bb in 0..256 { if present[bb] { a2c[bb] = alpha as u8; alpha += 1; } }
+    }
+    let alpha = alpha.max(1);
+
     let nspace = (p.max_space - p.min_space + 1) as usize;
     let mut candidates: Vec<Vec<Vec<Mite>>> = Vec::with_capacity(chroms.len());
     for seq in &seqs {
@@ -362,7 +385,7 @@ fn main() {
                     cursor[cc] += 1;
                 }
             }
-            join_detect(&gcode, &offsets, &starts_by_code, seq, &p, &mut spacer_vecs);
+            join_detect(&gcode, &offsets, &starts_by_code, seq, &p, &mut spacer_vecs, &a2c, alpha);
         }
         candidates.push(spacer_vecs);
     }
