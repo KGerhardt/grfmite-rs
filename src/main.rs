@@ -182,8 +182,11 @@ fn detect_tsd(seq: &[u8], start: usize, end: usize, min: i32, max: i32) -> Strin
     String::new()
 }
 
-// no-indel stem extension -> (cigar, tr1, tr2); empty cigar = no valid arm
-fn get_stem(s: &[u8], p: &Param) -> (String, u32, u32) {
+// no-indel stem extension -> (cigar, tr1, tr2); empty cigar = no valid arm.
+// `e` is the candidate's 2-bit encoding (ACGT->0..3, non-ACGT->4): pairing is
+// e[i]^e[j]==0b11 (complement = XOR 0b11; the 4-sentinel can never XOR to 0b11),
+// exactly equivalent to byte is_pair, so the cigar stays byte-identical.
+fn get_stem(e: &[u8], p: &Param) -> (String, u32, u32) {
     thread_local! {
         static SCRATCH: std::cell::RefCell<(Vec<u8>, Vec<i32>)> =
             std::cell::RefCell::new((Vec::new(), Vec::new()));
@@ -193,11 +196,11 @@ fn get_stem(s: &[u8], p: &Param) -> (String, u32, u32) {
         let (left, pos) = &mut *sc;
         left.clear();
         pos.clear();
-        let len = s.len();
+        let len = e.len();
         let mut error = 0i32;
         let (mut i, mut j) = (0usize, len - 1);
         while i < j {
-            if is_pair(s[i], s[j]) { left.push(b'm'); }
+            if e[i] ^ e[j] == 0b11 { left.push(b'm'); }
             else {
                 error += 1;
                 if error > p.max_mismatch { break; }
@@ -248,7 +251,7 @@ fn filter_low_complex(seq: &[u8], tir: &str, a2c: &[u8; 256], alpha: usize) -> b
 // Iterating `end` ascending makes each spacer bucket fill in ascending `start` order
 // (start = end - off2 for that spacer), so output stays byte-identical to the old scan.
 fn join_detect(gcode: &[u32], offsets: &[u32], starts_by_code: &[u32],
-               seq: &[u8], p: &Param, spacer_vecs: &mut [Vec<Mite>],
+               seq: &[u8], enc: &[u8], p: &Param, spacer_vecs: &mut [Vec<Mite>],
                a2c: &[u8; 256], alpha: usize) {
     let seed = p.seed as usize;
     let n = seq.len();
@@ -282,7 +285,7 @@ fn join_detect(gcode: &[u32], offsets: &[u32], starts_by_code: &[u32],
                 let cand = &seq[start..start + l];
                 let tsd = detect_tsd(seq, start, end, p.min_tsd, p.max_tsd);
                 if tsd.is_empty() { continue; }
-                let (cigar, tr1, tr2) = get_stem(cand, p); // max_indel == 0
+                let (cigar, tr1, tr2) = get_stem(&enc[start..start + l], p); // max_indel == 0
                 if !cigar.is_empty() && filter_low_complex(cand, &cigar, a2c, alpha) {
                     spacer_vecs[i_sp - min_space].push(Mite { start, end, tr1, tr2, tsd, tir: cigar });
                 }
@@ -360,6 +363,8 @@ fn main() {
                 }
                 if ok { fcode[p_] = val; }
             }
+            // enc[pos] = per-base 2-bit code (ACGT->0..3) or 4 for non-ACGT; used by get_stem.
+            let enc: Vec<u8> = seq.iter().map(|&b| code(b).map(|c| c as u8).unwrap_or(4)).collect();
             // gcode[end] = RC code of window [end-seed+1, end] = complement of each base, reversed,
             // so field k = comp(code(seq[end-k])). INVALID for end < seed-1 or any non-ACGT.
             let mut gcode: Vec<u32> = vec![INVALID; n];
@@ -385,7 +390,7 @@ fn main() {
                     cursor[cc] += 1;
                 }
             }
-            join_detect(&gcode, &offsets, &starts_by_code, seq, &p, &mut spacer_vecs, &a2c, alpha);
+            join_detect(&gcode, &offsets, &starts_by_code, seq, &enc, &p, &mut spacer_vecs, &a2c, alpha);
         }
         candidates.push(spacer_vecs);
     }
