@@ -18,21 +18,21 @@ struct Param {
     max_mismatch: i32,
     min_spacer_len: i32,
     max_spacer_len: i32,
+    emit_cigar: bool, // --rle-cigar: emit stock GRF RLE cigar (byte-identical, general-tool);
+                      // default false = emit the integer TIR arm length (TIR-Learner use-case)
 }
 impl Default for Param {
     fn default() -> Self {
         Param { seed: 10, seed_mismatch: 1, min_stem: 0, max_stem: i32::MAX, percent: 10,
                 min_space: -1, max_space: -1, min_tsd: 2, max_tsd: 10,
-                max_mismatch: i32::MAX, min_spacer_len: 0, max_spacer_len: i32::MAX }
+                max_mismatch: i32::MAX, min_spacer_len: 0, max_spacer_len: i32::MAX,
+                emit_cigar: false }
     }
 }
 
-struct Mite { start: usize, end: usize, tr1: u32, tr2: u32, tsd: String, tir: String }
-
-#[inline]
-fn is_pair(a: u8, b: u8) -> bool {
-    matches!((a, b), (b'A', b'T') | (b'C', b'G') | (b'G', b'C') | (b'T', b'A'))
-}
+// arm = clamped TIR arm length (= what TIR-Learner's parse_cig recovers); cigar = the stock
+// RLE m/M string, present only in --rle-cigar mode (None in the default integer mode).
+struct Mite { start: usize, end: usize, arm: u32, tsd: String, cigar: Option<String> }
 
 // 2-bit base code with complement == XOR 0b11 (A=00 C=01 G=10 T=11); None = non-ACGT.
 #[inline]
@@ -54,17 +54,6 @@ fn compress(s: &[u8]) -> String {
     r.push_str(&num.to_string());
     r.push(prev as char);
     r
-}
-
-// sum of run-length counts whose symbol != c  (cigar parse)
-fn get_stem_len(s: &str, c: char) -> i32 {
-    let (mut num, mut count) = (0i32, 0i32);
-    for ch in s.chars() {
-        let d = ch as i32 - '0' as i32;
-        if (0..=9).contains(&d) { count = count * 10 + d; }
-        else { if ch != c { num += count; } count = 0; }
-    }
-    num
 }
 
 fn gc_content(s: &[u8]) -> f32 {
@@ -182,11 +171,42 @@ fn detect_tsd(seq: &[u8], start: usize, end: usize, min: i32, max: i32) -> Strin
     String::new()
 }
 
-// no-indel stem extension -> (cigar, tr1, tr2); empty cigar = no valid arm.
-// `e` is the candidate's 2-bit encoding (ACGT->0..3, non-ACGT->4): pairing is
-// e[i]^e[j]==0b11 (complement = XOR 0b11; the 4-sentinel can never XOR to 0b11),
-// exactly equivalent to byte is_pair, so the cigar stays byte-identical.
-fn get_stem(e: &[u8], p: &Param) -> (String, u32, u32) {
+// Default fast path: no-indel stem extension returning ONLY the clamped TIR arm length
+// (= what stock GRF's cigar would sum to via TIR-Learner's parse_cig). No m/M buffer, no
+// cigar string. `e` is the candidate's 2-bit encoding (ACGT->0..3, non-ACGT->4); pairing is
+// e[i]^e[j]==0b11 (complement = XOR 0b11; the 4-sentinel can never XOR to 0b11). None = no arm.
+fn stem_arm(e: &[u8], p: &Param) -> Option<u32> {
+    thread_local! { static POS: std::cell::RefCell<Vec<i32>> = std::cell::RefCell::new(Vec::new()); }
+    POS.with(|pc| {
+        let pos = &mut *pc.borrow_mut();
+        pos.clear();
+        let len = e.len();
+        let mut error = 0i32;
+        let mut last_m = -1i32; // largest i that paired (== rposition of 'm')
+        let (mut i, mut j) = (0usize, len - 1);
+        while i < j {
+            if e[i] ^ e[j] == 0b11 { last_m = i as i32; }
+            else {
+                error += 1;
+                if error > p.max_mismatch { break; }
+                pos.push(i as i32);
+            }
+            i += 1;
+            j -= 1;
+        }
+        let len2 = last_m + 1; // index after last 'm', or 0
+        pos.push(len2);
+        for idx in (0..pos.len()).rev() {
+            if pos[idx] >= p.min_stem && (idx as i32) * 100 <= p.percent * pos[idx] {
+                return Some(pos[idx].min(len2) as u32); // clamp == C++ substr clamp == parse_cig value
+            }
+        }
+        None
+    })
+}
+
+// --rle-cigar path: same arm length, plus the stock GRF RLE m/M cigar (byte-identical output).
+fn stem_cigar(e: &[u8], p: &Param) -> Option<(u32, String)> {
     thread_local! {
         static SCRATCH: std::cell::RefCell<(Vec<u8>, Vec<i32>)> =
             std::cell::RefCell::new((Vec::new(), Vec::new()));
@@ -210,26 +230,23 @@ fn get_stem(e: &[u8], p: &Param) -> (String, u32, u32) {
             i += 1;
             j -= 1;
         }
-        // trim trailing 'M' (len2 = index after last 'm', or 0 if none)
         let len2 = left.iter().rposition(|&c| c == b'm').map(|x| x + 1).unwrap_or(0);
         left.truncate(len2);
-        // percent != 100 path
         pos.push(len2 as i32);
         for idx in (0..pos.len()).rev() {
             if pos[idx] >= p.min_stem && (idx as i32) * 100 <= p.percent * pos[idx] {
-                let cigar = compress(&left[0..(pos[idx] as usize).min(left.len())]); // C++ substr clamps
-                return (cigar, pos[idx] as u32, pos[idx] as u32);
+                let arm = (pos[idx] as usize).min(left.len()); // C++ substr clamps
+                return Some((arm as u32, compress(&left[0..arm])));
             }
         }
-        (String::new(), 0, 0)
+        None
     })
 }
 
-fn filter_low_complex(seq: &[u8], tir: &str, a2c: &[u8; 256], alpha: usize) -> bool {
-    let len1 = get_stem_len(tir, 'D') as usize;
-    let len2 = get_stem_len(tir, 'I') as usize;
-    let l = &seq[0..len1];
-    let r = &seq[seq.len() - len2..];
+// arm == both TR lengths (no-indel => len1 == len2 == arm == old get_stem_len(cigar,_)).
+fn filter_low_complex(seq: &[u8], arm: usize, a2c: &[u8; 256], alpha: usize) -> bool {
+    let l = &seq[0..arm];
+    let r = &seq[seq.len() - arm..];
     let gc1 = gc_content(l) as f64;
     let gc2 = gc_content(r) as f64;
     if gc1 < 0.2 || gc1 > 0.8 || gc2 < 0.2 || gc2 > 0.8 { return false; }
@@ -285,9 +302,16 @@ fn join_detect(gcode: &[u32], offsets: &[u32], starts_by_code: &[u32],
                 let cand = &seq[start..start + l];
                 let tsd = detect_tsd(seq, start, end, p.min_tsd, p.max_tsd);
                 if tsd.is_empty() { continue; }
-                let (cigar, tr1, tr2) = get_stem(&enc[start..start + l], p); // max_indel == 0
-                if !cigar.is_empty() && filter_low_complex(cand, &cigar, a2c, alpha) {
-                    spacer_vecs[i_sp - min_space].push(Mite { start, end, tr1, tr2, tsd, tir: cigar });
+                let ecand = &enc[start..start + l]; // max_indel == 0
+                let stem = if p.emit_cigar {
+                    stem_cigar(ecand, p).map(|(a, c)| (a, Some(c)))
+                } else {
+                    stem_arm(ecand, p).map(|a| (a, None))
+                };
+                if let Some((arm, cigar)) = stem {
+                    if filter_low_complex(cand, arm as usize, a2c, alpha) {
+                        spacer_vecs[i_sp - min_space].push(Mite { start, end, arm, tsd, cigar });
+                    }
                 }
             }
         }
@@ -318,6 +342,7 @@ fn main() {
             "--max_tsd" => p.max_tsd = val(&mut k).parse().unwrap(),
             "--min_spacer_len" => p.min_spacer_len = val(&mut k).parse().unwrap(),
             "--max_spacer_len" => p.max_spacer_len = val(&mut k).parse().unwrap(),
+            "--rle-cigar" => p.emit_cigar = true,
             _ => {}
         }
         k += 1;
@@ -401,13 +426,16 @@ fn main() {
     for j in 0..nspace {
         for ci in 0..chroms.len() {
             for m in &candidates[ci][j] {
-                let len1 = get_stem_len(&m.tir, 'D');
-                let len2 = get_stem_len(&m.tir, 'I');
+                let (len1, len2) = (m.arm as i32, m.arm as i32); // no-indel: both TR lengths == arm
                 let len3 = (m.end as i32) - (m.start as i32) + 1 - len1 - len2;
                 if len1 >= p.min_stem && len1 <= p.max_stem
                     && len2 >= p.min_stem && len2 <= p.max_stem
                     && len3 >= p.min_spacer_len && len3 <= p.max_spacer_len {
-                    writeln!(w, ">{}:{}:{}:{}:{}", chroms[ci], m.start + 1, m.end + 1, m.tir, m.tsd).unwrap();
+                    // tir field: stock RLE cigar (--rle-cigar) or the integer arm length (default)
+                    match &m.cigar {
+                        Some(c) => writeln!(w, ">{}:{}:{}:{}:{}", chroms[ci], m.start + 1, m.end + 1, c, m.tsd).unwrap(),
+                        None => writeln!(w, ">{}:{}:{}:{}:{}", chroms[ci], m.start + 1, m.end + 1, m.arm, m.tsd).unwrap(),
+                    }
                     writeln!(w, "{}", std::str::from_utf8(&seqs[ci][m.start..=m.end]).unwrap()).unwrap();
                 }
             }
