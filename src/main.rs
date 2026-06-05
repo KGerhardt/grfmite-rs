@@ -352,44 +352,15 @@ fn join_detect(gcode: &[u32], offsets: &[u32], starts_by_code: &[u32],
     }
 }
 
-fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    let mut p = Param::default();
-    let (mut input, mut outdir) = (String::new(), String::from("."));
-    let mut k = 1;
-    while k < args.len() {
-        let a = args[k].clone();
-        let mut val = |k: &mut usize| { *k += 1; args[*k].clone() };
-        match a.as_str() {
-            "-i" => input = val(&mut k),
-            "-o" => outdir = val(&mut k),
-            "-c" => { val(&mut k); }
-            "-t" => p.threads = val(&mut k).parse().unwrap_or(1).max(1),
-            "-p" => p.percent = val(&mut k).parse().unwrap(),
-            "-s" => p.seed = val(&mut k).parse().unwrap(),
-            "--seed_mismatch" => p.seed_mismatch = val(&mut k).parse().unwrap(),
-            "--min_tr" => p.min_stem = val(&mut k).parse().unwrap(),
-            "--max_indel" => { val(&mut k); }
-            "--min_space" => p.min_space = val(&mut k).parse().unwrap(),
-            "--max_space" => p.max_space = val(&mut k).parse().unwrap(),
-            "--min_tsd" => p.min_tsd = val(&mut k).parse().unwrap(),
-            "--max_tsd" => p.max_tsd = val(&mut k).parse().unwrap(),
-            "--min_spacer_len" => p.min_spacer_len = val(&mut k).parse().unwrap(),
-            "--max_spacer_len" => p.max_spacer_len = val(&mut k).parse().unwrap(),
-            "--rle-cigar" => p.emit_cigar = true,
-            _ => {}
-        }
-        k += 1;
-    }
-
-    if p.threads > 1 {
-        rayon::ThreadPoolBuilder::new().num_threads(p.threads).build_global().ok();
-    }
-
+// Process one input fasta end-to-end and write its candidate.fasta to out_path.
+// In --batch mode this is the unit fed to the outer rayon pool; join_detect's inner
+// chunk-parallelism nests in the same pool, so idle workers steal a dense file's chunks
+// (global work-stealing: bulk = inter-file, tail = intra-file).
+fn run_file(in_path: &str, out_path: &str, p: &Param) {
     // read fasta (uppercased); chrom name = first whitespace token of the header
     let mut chroms: Vec<String> = Vec::new();
     let mut seqs: Vec<Vec<u8>> = Vec::new();
-    let mut reader = parse_fastx_file(&input).expect("open fasta");
+    let mut reader = parse_fastx_file(in_path).expect("open fasta");
     while let Some(rec) = reader.next() {
         let rec = rec.expect("record");
         let id = rec.id();
@@ -398,7 +369,7 @@ fn main() {
         seqs.push(rec.seq().iter().map(|b| b.to_ascii_uppercase()).collect());
     }
 
-    // Dense byte->code map over the genome's actual alphabet (injective on every byte that
+    // Dense byte->code map over this file's actual alphabet (injective on every byte that
     // appears -> seq_complexity's array transitions are byte-identical to the HashMap version).
     let mut a2c = [0u8; 256];
     let mut alpha = 0usize;
@@ -459,7 +430,7 @@ fn main() {
     }
 
     // output (spacer, chrom, candidate order) + inline grf-filter (TR len + spacer len)
-    let f = File::create(format!("{}/candidate.fasta", outdir)).expect("create out");
+    let f = File::create(out_path).expect("create out");
     let mut w = BufWriter::new(f);
     for j in 0..nspace {
         for ci in 0..chroms.len() {
@@ -478,5 +449,61 @@ fn main() {
                 }
             }
         }
+    }
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let mut p = Param::default();
+    let (mut input, mut outdir) = (String::new(), String::from("."));
+    let mut batch: Option<String> = None; // --batch <listfile>: one input fasta path per line
+    let mut k = 1;
+    while k < args.len() {
+        let a = args[k].clone();
+        let mut val = |k: &mut usize| { *k += 1; args[*k].clone() };
+        match a.as_str() {
+            "-i" => input = val(&mut k),
+            "-o" => outdir = val(&mut k),
+            "-c" => { val(&mut k); }
+            "-t" => p.threads = val(&mut k).parse().unwrap_or(1).max(1),
+            "-p" => p.percent = val(&mut k).parse().unwrap(),
+            "-s" => p.seed = val(&mut k).parse().unwrap(),
+            "--seed_mismatch" => p.seed_mismatch = val(&mut k).parse().unwrap(),
+            "--min_tr" => p.min_stem = val(&mut k).parse().unwrap(),
+            "--max_indel" => { val(&mut k); }
+            "--min_space" => p.min_space = val(&mut k).parse().unwrap(),
+            "--max_space" => p.max_space = val(&mut k).parse().unwrap(),
+            "--min_tsd" => p.min_tsd = val(&mut k).parse().unwrap(),
+            "--max_tsd" => p.max_tsd = val(&mut k).parse().unwrap(),
+            "--min_spacer_len" => p.min_spacer_len = val(&mut k).parse().unwrap(),
+            "--max_spacer_len" => p.max_spacer_len = val(&mut k).parse().unwrap(),
+            "--rle-cigar" => p.emit_cigar = true,
+            "--batch" => batch = Some(val(&mut k)),
+            _ => {}
+        }
+        k += 1;
+    }
+
+    // One global pool sized to -t. In --batch, the outer par_iter over files AND join_detect's
+    // inner chunk par_iter share it -> single global work-stealing pool across all files.
+    rayon::ThreadPoolBuilder::new().num_threads(p.threads).build_global().ok();
+
+    match batch {
+        Some(listfile) => {
+            let list = std::fs::read_to_string(&listfile).expect("read batch list");
+            let paths: Vec<String> = list.lines().map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()).collect();
+            let t0 = std::time::Instant::now();
+            paths.par_iter().for_each(|ip| {
+                let base = std::path::Path::new(ip).file_stem()
+                    .map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "out".into());
+                let od = format!("{}/{}", outdir, base);
+                std::fs::create_dir_all(&od).ok();
+                run_file(ip, &format!("{}/candidate.fasta", od), &p);
+            });
+            eprintln!("[batch] files={} threads={} wall={:.1}s",
+                paths.len(), p.threads, t0.elapsed().as_secs_f64());
+        }
+        None => run_file(&input, &format!("{}/candidate.fasta", outdir), &p),
     }
 }
