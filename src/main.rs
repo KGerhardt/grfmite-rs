@@ -224,33 +224,57 @@ fn filter_low_complex(seq: &[u8], tir: &str) -> bool {
     true
 }
 
-// Exact seed match via precomputed 2-bit codes (replaces the abs_sum skew proxy + byte
-// two-pointer loop). fcode[start] = forward window code; gcode[end] = RC-window code, so
-// field k of (fcode[start] ^ gcode[end]) is zero iff seq[start+k] pairs with seq[end-k].
-// Requirement (byte-identical to is_pair k=0 + unpair loop): field 0 must match exactly,
-// and <= seed_mismatch fields differ overall (field 0 already 0, so that's fields 1..seed).
-fn detect_str(i_sp: i32, fcode: &[u32], gcode: &[u32], seq: &[u8], p: &Param, v: &mut Vec<Mite>) {
-    let seed = p.seed;
-    let num_i = fcode.len() as i64 - i_sp as i64 - seed as i64;
-    if num_i <= 0 { return; }
-    let num = num_i as usize;
-    let l = (i_sp + 2 * seed) as usize;
-    let off2 = l - 1; // end = start + off2; gcode[off2..off2+num] == gcode[off2..gcode.len()]
-    let mask_low: u32 = 0x5555_5555 & ((1u32 << (2 * seed)) - 1); // low bit of each 2-bit field
-    // zip elides bounds checks on the 2.5e9 hot path (off2 + num == gcode.len())
-    for (j, (&fj, &gend)) in fcode[..num].iter().zip(&gcode[off2..]).enumerate() {
-        if fj == INVALID || gend == INVALID { continue; }
-        let xor = fj ^ gend;
-        if xor & 0b11 != 0 { continue; } // k=0 (outermost pair) must match exactly
-        let mism = ((xor | (xor >> 1)) & mask_low).count_ones() as i32;
-        if mism > p.seed_mismatch { continue; }
-        let (start, end) = (j, j + l - 1);
-        let cand = &seq[start..start + l];
-        let tsd = detect_tsd(seq, start, end, p.min_tsd, p.max_tsd);
-        if tsd.is_empty() { continue; }
-        let (cigar, tr1, tr2) = get_stem(cand, p); // max_indel == 0
-        if !cigar.is_empty() && filter_low_complex(cand, &cigar) {
-            v.push(Mite { start, end, tr1, tr2, tsd, tir: cigar });
+// Seed match via a code-keyed join instead of scanning all O(n*spacer_range) pairs.
+// fcode[start] = forward window code; gcode[end] = RC-window code; a seed match (byte-
+// identical to is_pair k=0 + <=seed_mismatch inner) means fcode[start] equals gcode[end]
+// EXCEPT for <= seed_mismatch of the inner fields (field 0 must match exactly).
+//
+// For seed_mismatch==1 the set of fcode values matching a given gcode[end] is exactly:
+//   { gcode[end] } U { gcode[end] with one inner field (1..seed) set to a different base }
+// = 1 + 3*(seed-1) neighbor codes. We look each up in the CSR index (code -> ascending
+// start list) and keep starts in the spacer window [end-max_off2, end-min_off2].
+//
+// Iterating `end` ascending makes each spacer bucket fill in ascending `start` order
+// (start = end - off2 for that spacer), so output stays byte-identical to the old scan.
+fn join_detect(gcode: &[u32], offsets: &[u32], starts_by_code: &[u32],
+               seq: &[u8], p: &Param, spacer_vecs: &mut [Vec<Mite>]) {
+    let seed = p.seed as usize;
+    let n = seq.len();
+    let min_off2 = (p.min_space + 2 * p.seed - 1) as usize; // end - start at min spacer
+    let max_off2 = (p.max_space + 2 * p.seed - 1) as usize; // end - start at max spacer
+    let twoseed_m1 = (2 * p.seed - 1) as usize;
+    let min_space = p.min_space as usize;
+    let mut codes: Vec<u32> = Vec::with_capacity(1 + 3 * (seed - 1));
+    for end in min_off2..n {
+        let g = gcode[end];
+        if g == INVALID { continue; }
+        let hi = end - min_off2; // start <= hi  (i_sp >= min_space)
+        let lo = end.saturating_sub(max_off2); // start >= lo  (i_sp <= max_space)
+        // neighbor fcode values: g itself + each inner field flipped to its 3 alternatives
+        codes.clear();
+        codes.push(g);
+        for k in 1..seed {
+            let sh = 2 * k;
+            let cur = (g >> sh) & 3;
+            let base = g & !(3u32 << sh);
+            for v in 0..4u32 { if v != cur { codes.push(base | (v << sh)); } }
+        }
+        for &c in &codes {
+            let bucket = &starts_by_code[offsets[c as usize] as usize..offsets[c as usize + 1] as usize];
+            let si = bucket.partition_point(|&x| (x as usize) < lo);
+            for &st in &bucket[si..] {
+                let start = st as usize;
+                if start > hi { break; }
+                let l = end - start + 1; // = i_sp + 2*seed
+                let i_sp = end - start - twoseed_m1; // in [min_space, max_space]
+                let cand = &seq[start..start + l];
+                let tsd = detect_tsd(seq, start, end, p.min_tsd, p.max_tsd);
+                if tsd.is_empty() { continue; }
+                let (cigar, tr1, tr2) = get_stem(cand, p); // max_indel == 0
+                if !cigar.is_empty() && filter_low_complex(cand, &cigar) {
+                    spacer_vecs[i_sp - min_space].push(Mite { start, end, tr1, tr2, tsd, tir: cigar });
+                }
+            }
         }
     }
 }
@@ -324,9 +348,21 @@ fn main() {
                 }
                 if ok { gcode[end] = val; }
             }
-            for i_sp in p.min_space..=p.max_space {
-                detect_str(i_sp, &fcode, &gcode, seq, &p, &mut spacer_vecs[(i_sp - p.min_space) as usize]);
+            // CSR index: fcode value -> ascending list of start positions (seed=10 => 2^20 codes).
+            let ncode = 1usize << (2 * seed);
+            let mut offsets = vec![0u32; ncode + 1];
+            for &c in &fcode { if c != INVALID { offsets[c as usize + 1] += 1; } }
+            for i in 0..ncode { offsets[i + 1] += offsets[i]; }
+            let mut starts_by_code = vec![0u32; offsets[ncode] as usize];
+            let mut cursor = offsets.clone();
+            for (start, &c) in fcode.iter().enumerate() {
+                if c != INVALID {
+                    let cc = c as usize;
+                    starts_by_code[cursor[cc] as usize] = start as u32;
+                    cursor[cc] += 1;
+                }
             }
+            join_detect(&gcode, &offsets, &starts_by_code, seq, &p, &mut spacer_vecs);
         }
         candidates.push(spacer_vecs);
     }
