@@ -3,6 +3,18 @@ name = "grf_rs"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "grf_rs"
+crate-type = ["rlib", "cdylib"]
+
+[[bin]]
+name = "grf_rs"
+path = "src/main.rs"
+
 [dependencies]
 needletail = "0.7.3"
 rayon = "1"
+pyo3 = { version = "0.22", features = ["extension-module", "abi3-py38"], optional = true }
+
+[features]
+python = ["dep:pyo3"]
