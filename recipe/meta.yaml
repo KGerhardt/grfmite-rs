@@ -7,11 +7,10 @@ package:
 
 source:
   url: https://github.com/KGerhardt/grfmite-rs/archive/refs/tags/v{{ version }}.tar.gz
-  sha256: 0000000000000000000000000000000000000000000000000000000000000000  # TODO: fill from the public v0.1.0 release tarball
+  sha256: 4be41899f72ce200f95c97fc9bd163ef7379fb34bcff4903dd516ef76a4dcab7
 
 build:
   number: 0
-  script: {{ "$RECIPE_DIR/build.sh" }}
 
 requirements:
   build:
