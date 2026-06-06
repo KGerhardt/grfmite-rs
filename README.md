@@ -1,22 +1,28 @@
 # grfmite-rs
 
-A fast, parallel Rust reimplementation of the one [GRF](https://github.com/bioinfolabmu/GenericRepeatFinder)
-mode that [TIR-Learner](https://github.com/KGerhardt/TIR-Learner) uses: `grf-main -c 1`
-(MITE candidate detection). It is a drop-in replacement for that step, with a single
-work-stealing batch mode over many genome chunks.
+Rust port and acceleration of the GRFMite subprogram of
+[Generic Repeat Finder](https://github.com/bioinfolabmu/GenericRepeatFinder), developed for
+[TIR-Learner v4](https://github.com/KGerhardt/TIR-Learner).
 
-**Scope:** this implements *only* the MITE path (`-c 1`) — the only GRF mode TIR-Learner
-invokes. It is **not** a full GRF port (no `-c 0` / `-c 2`, no other GRF binaries). A
-complete GRF overhaul is intended for a future release.
+TIR-Learner uses a genome fragmentation approach
+([genomeSplitter](https://github.com/KGerhardt/genomeSplitter)) to produce ~5 Mbp sequence
+chunks. Some chunks are pathological to repeat-finder programs like GRF: low-complexity sequence
+causes GRF to emit a very large number of possible repeat matches, few of which are biologically
+interesting targets. In centromeric and other satellite regions, the worst case involves chunks
+that run hundreds to thousands of times slower than typical 5 Mbp fragments. Especially in
+high-thread-count deployments, this dramatically harms TIR-Learner's performance, as a few
+pathological chunks consume the vast majority of total runtime.
 
-## Why
+This Rust port of GRFMite includes multiple algorithmic improvements that dramatically improve
+performance while maintaining identical results (see
+[Changes from stock GRF](docs/CHANGES_FROM_C.md)), plus a Rust parallel work-stealing model that
+reduces the impact of pathological chunks by supplying additional worker threads to those chunks
+when they appear.
 
-On the genomes TIR-Learner targets, stock GRF's MITE detection is the runtime bottleneck and
-its load is highly uneven — a few repeat-dense chunks run hundreds of times longer than the
-rest, stranding cores on large machines. grfmite-rs removes the algorithmic blowup in
-candidate finding and adds intra-chunk work-stealing so those stragglers no longer floor the
-wall. It is byte-identical to stock GRF (`--rle-cigar`) and **40–55× faster single-threaded** —
-see Benchmarks.
+**Scope:** only the MITE path (`grf-main -c 1`) — the one GRF mode TIR-Learner invokes — is
+implemented. This is **not** a full GRF port (no `-c 0` / `-c 2`, no other GRF binaries); a
+complete GRF overhaul is intended for a future release. Byte-identical to stock GRF in
+`--rle-cigar` mode and **40–55× faster single-threaded** (see Benchmarks below).
 
 ## Benchmarks
 
