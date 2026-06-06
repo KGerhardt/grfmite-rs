@@ -11,7 +11,8 @@ causes GRF to emit a very large number of possible repeat matches, few of which 
 interesting targets. In centromeric and other satellite regions, the worst case involves chunks
 that run hundreds to thousands of times slower than typical 5 Mbp fragments. Especially in
 high-thread-count deployments, this dramatically harms TIR-Learner's performance, as a few
-pathological chunks consume the vast majority of total runtime.
+pathological chunks consume the vast majority of total runtime while most threads lie idle, 
+having finished processing all non-pathological genome chunks in a fraction of the time.
 
 This Rust port of GRFMite includes multiple algorithmic improvements that dramatically improve
 performance while maintaining identical results (see
