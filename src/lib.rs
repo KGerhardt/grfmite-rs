@@ -22,13 +22,16 @@ pub struct Param {
     pub emit_cigar: bool, // --rle-cigar: emit stock GRF RLE cigar (byte-identical, general-tool);
                           // default false = emit the integer TIR arm length (TIR-Learner use-case)
     pub threads: usize,   // -t: intra-file parallelism over the end-loop (1 = serial)
+    pub legacy_fasta: bool, // --legacy-fasta: emit the old candidate.fasta (header + full
+                            // subsequence) for drop-in GRF compat. default false = emit
+                            // candidate.json (coords only; TIR-Learner reslices seq/TSD by coord)
 }
 impl Default for Param {
     fn default() -> Self {
         Param { seed: 10, seed_mismatch: 1, min_stem: 0, max_stem: i32::MAX, percent: 10,
                 min_space: -1, max_space: -1, min_tsd: 2, max_tsd: 10,
                 max_mismatch: i32::MAX, min_spacer_len: 0, max_spacer_len: i32::MAX,
-                emit_cigar: false, threads: 1 }
+                emit_cigar: false, threads: 1, legacy_fasta: false }
     }
 }
 
@@ -429,26 +432,59 @@ pub fn run_file(in_path: &str, out_path: &str, p: &Param) {
         candidates.push(spacer_vecs);
     }
 
-    // output (spacer, chrom, candidate order) + inline grf-filter (TR len + spacer len)
+    // inline grf-filter (TR len + spacer len): a candidate is emitted iff this holds.
+    let passes = |m: &Mite| {
+        let (len1, len2) = (m.arm as i32, m.arm as i32); // no-indel: both TR lengths == arm
+        let len3 = (m.end as i32) - (m.start as i32) + 1 - len1 - len2;
+        len1 >= p.min_stem && len1 <= p.max_stem
+            && len2 >= p.min_stem && len2 <= p.max_stem
+            && len3 >= p.min_spacer_len && len3 <= p.max_spacer_len
+    };
     let f = File::create(out_path).expect("create out");
     let mut w = BufWriter::new(f);
-    for j in 0..nspace {
-        for ci in 0..chroms.len() {
-            for m in &candidates[ci][j] {
-                let (len1, len2) = (m.arm as i32, m.arm as i32); // no-indel: both TR lengths == arm
-                let len3 = (m.end as i32) - (m.start as i32) + 1 - len1 - len2;
-                if len1 >= p.min_stem && len1 <= p.max_stem
-                    && len2 >= p.min_stem && len2 <= p.max_stem
-                    && len3 >= p.min_spacer_len && len3 <= p.max_spacer_len {
-                    // tir field: stock RLE cigar (--rle-cigar) or the integer arm length (default)
-                    match &m.cigar {
-                        Some(c) => writeln!(w, ">{}:{}:{}:{}:{}", chroms[ci], m.start + 1, m.end + 1, c, m.tsd).unwrap(),
-                        None => writeln!(w, ">{}:{}:{}:{}:{}", chroms[ci], m.start + 1, m.end + 1, m.arm, m.tsd).unwrap(),
+    if p.legacy_fasta {
+        // Legacy candidate.fasta: per-candidate header + full subsequence (drop-in GRF compat).
+        for j in 0..nspace {
+            for ci in 0..chroms.len() {
+                for m in &candidates[ci][j] {
+                    if passes(m) {
+                        // tir field: stock RLE cigar (--rle-cigar) or the integer arm length (default)
+                        match &m.cigar {
+                            Some(c) => writeln!(w, ">{}:{}:{}:{}:{}", chroms[ci], m.start + 1, m.end + 1, c, m.tsd).unwrap(),
+                            None => writeln!(w, ">{}:{}:{}:{}:{}", chroms[ci], m.start + 1, m.end + 1, m.arm, m.tsd).unwrap(),
+                        }
+                        writeln!(w, "{}", std::str::from_utf8(&seqs[ci][m.start..=m.end]).unwrap()).unwrap();
                     }
-                    writeln!(w, "{}", std::str::from_utf8(&seqs[ci][m.start..=m.end]).unwrap()).unwrap();
                 }
             }
         }
+    } else {
+        // Default candidate.json: chrom-keyed columnar coordinates, no sequence. All integers:
+        // start/end (1-based inclusive), arm (TIR-arm length), tsd (TSD size). TIR-Learner reslices
+        // the element sequence and TSD bases from the chunk fasta by these coordinates.
+        write!(w, "{{").unwrap();
+        let mut first_chrom = true;
+        for ci in 0..chroms.len() {
+            let mut sel: Vec<&Mite> = Vec::new();
+            for j in 0..nspace {
+                for m in &candidates[ci][j] {
+                    if passes(m) { sel.push(m); }
+                }
+            }
+            if sel.is_empty() { continue; }
+            if !first_chrom { w.write_all(b",").unwrap(); }
+            first_chrom = false;
+            write!(w, "\"{}\":{{\"start\":[", chroms[ci]).unwrap();
+            for (i, m) in sel.iter().enumerate() { if i > 0 { w.write_all(b",").unwrap(); } write!(w, "{}", m.start + 1).unwrap(); }
+            write!(w, "],\"end\":[").unwrap();
+            for (i, m) in sel.iter().enumerate() { if i > 0 { w.write_all(b",").unwrap(); } write!(w, "{}", m.end + 1).unwrap(); }
+            write!(w, "],\"arm\":[").unwrap();
+            for (i, m) in sel.iter().enumerate() { if i > 0 { w.write_all(b",").unwrap(); } write!(w, "{}", m.arm).unwrap(); }
+            write!(w, "],\"tsd\":[").unwrap();
+            for (i, m) in sel.iter().enumerate() { if i > 0 { w.write_all(b",").unwrap(); } write!(w, "{}", m.tsd.len()).unwrap(); }
+            w.write_all(b"]}").unwrap();
+        }
+        w.write_all(b"}").unwrap();
     }
 }
 
@@ -467,7 +503,8 @@ pub fn run_batch(paths: &[String], outdir: &str, p: &Param) -> f64 {
             .map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "out".into());
         let od = format!("{}/{}", outdir, base);
         std::fs::create_dir_all(&od).ok();
-        run_file(ip, &format!("{}/candidate.fasta", od), p);
+        let fname = if p.legacy_fasta { "candidate.fasta" } else { "candidate.json" };
+        run_file(ip, &format!("{}/{}", od, fname), p);
     });
     t0.elapsed().as_secs_f64()
 }
@@ -558,7 +595,7 @@ mod python {
         let p = Param { seed: 10, seed_mismatch: 1, min_stem: 10, max_stem: i32::MAX, percent: 20,
                         min_space: 10, max_space: max_tir_len, min_tsd: 2, max_tsd: 10,
                         max_mismatch: i32::MAX, min_spacer_len: 10, max_spacer_len: max_tir_len,
-                        emit_cigar: false, threads };
+                        emit_cigar: false, threads, legacy_fasta: false };
         let pool = rayon::ThreadPoolBuilder::new().num_threads(threads.max(1)).build()
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
         let recs = py.allow_threads(|| {

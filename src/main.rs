@@ -28,6 +28,7 @@ fn main() {
             "--min_spacer_len" => p.min_spacer_len = val(&mut k).parse().unwrap(),
             "--max_spacer_len" => p.max_spacer_len = val(&mut k).parse().unwrap(),
             "--rle-cigar" => p.emit_cigar = true,
+            "--legacy-fasta" => p.legacy_fasta = true,
             "--batch" => batch = Some(val(&mut k)),
             _ => {}
         }
@@ -44,6 +45,9 @@ fn main() {
             let secs = run_batch(&paths, &outdir, &p);
             eprintln!("[batch] files={} threads={} wall={:.1}s", paths.len(), p.threads, secs);
         }
-        None => run_file(&input, &format!("{}/candidate.fasta", outdir), &p),
+        None => {
+            let fname = if p.legacy_fasta { "candidate.fasta" } else { "candidate.json" };
+            run_file(&input, &format!("{}/{}", outdir, fname), &p);
+        }
     }
 }
