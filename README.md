@@ -1,5 +1,7 @@
 # grfmite-rs
 
+[![install with bioconda](https://img.shields.io/badge/install%20with-bioconda-brightgreen.svg?style=flat)](https://anaconda.org/bioconda/grfmite-rs)
+
 Rust port and acceleration of the GRFMite subprogram of
 [Generic Repeat Finder](https://github.com/bioinfolabmu/GenericRepeatFinder), developed for
 [TIR-Learner v4](https://github.com/KGerhardt/TIR-Learner).
@@ -56,7 +58,7 @@ See `docs/CHANGES_FROM_C.md` for the full list of algorithmic changes vs stock G
 
 ## Install
 
-Conda (once published):
+Conda (recommended) — available on [bioconda](https://anaconda.org/bioconda/grfmite-rs):
 
 ```shell
 conda install -c conda-forge -c bioconda grfmite-rs
