@@ -495,16 +495,20 @@ pub fn set_threads(threads: usize) {
 
 // CLI --batch: outer par_iter over files + join_detect's inner chunk par_iter share one pool
 // -> single global work-stealing pool (bulk = inter-file, tail = intra-file). Writes
-// <outdir>/<basename>/candidate.fasta per input. Returns elapsed seconds.
+// One flat file per input: <outdir>/<basename>.json (or <basename>.candidate.fasta for
+// --legacy-fasta). No per-chunk directory, so batch output costs N inodes, not 2N — meaningful
+// on HPC shared filesystems with file-count quotas. Returns elapsed seconds.
 pub fn run_batch(paths: &[String], outdir: &str, p: &Param) -> f64 {
     let t0 = std::time::Instant::now();
     paths.par_iter().for_each(|ip| {
         let base = std::path::Path::new(ip).file_stem()
             .map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "out".into());
-        let od = format!("{}/{}", outdir, base);
-        std::fs::create_dir_all(&od).ok();
-        let fname = if p.legacy_fasta { "candidate.fasta" } else { "candidate.json" };
-        run_file(ip, &format!("{}/{}", od, fname), p);
+        let out_path = if p.legacy_fasta {
+            format!("{}/{}.candidate.fasta", outdir, base)
+        } else {
+            format!("{}/{}.json", outdir, base)
+        };
+        run_file(ip, &out_path, p);
     });
     t0.elapsed().as_secs_f64()
 }
