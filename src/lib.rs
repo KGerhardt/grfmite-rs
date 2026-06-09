@@ -37,7 +37,7 @@ impl Default for Param {
 
 // arm = clamped TIR arm length (= what TIR-Learner's parse_cig recovers); cigar = the stock
 // RLE m/M string, present only in --rle-cigar mode (None in the default integer mode).
-struct Mite { start: usize, end: usize, arm: u32, tsd: String, cigar: Option<String> }
+struct Mite { start: usize, end: usize, arm: u32, tsd_len: u32, cigar: Option<String> }
 
 // 2-bit base code with complement == XOR 0b11 (A=00 C=01 G=10 T=11); None = non-ACGT.
 #[inline]
@@ -163,17 +163,20 @@ fn seq_complexity(seq: &[u8], a2c: &[u8; 256], alpha: usize) -> f64 {
     })
 }
 
-fn detect_tsd(seq: &[u8], start: usize, end: usize, min: i32, max: i32) -> String {
+// Returns the TSD LENGTH (matched flank size), or 0 if none. The TSD bases are exactly
+// seq[start - len .. start]; callers needing the string (legacy fasta) reslice at write
+// time, so we don't allocate a String per candidate.
+fn detect_tsd(seq: &[u8], start: usize, end: usize, min: i32, max: i32) -> usize {
     let mut i = max;
     while i >= min {
         let iu = i as usize;
         if start < iu || end + iu > seq.len() - 1 { i -= 1; continue; }
         if seq[start - iu..start] == seq[end + 1..end + 1 + iu] {
-            return String::from_utf8_lossy(&seq[start - iu..start]).into_owned();
+            return iu;
         }
         i -= 1;
     }
-    String::new()
+    0
 }
 
 // Default fast path: no-indel stem extension returning ONLY the clamped TIR arm length
@@ -306,8 +309,8 @@ fn detect_range(end_lo: usize, end_hi: usize, gcode: &[u32], offsets: &[u32],
                 if start > hi { break; }
                 let l = end - start + 1; // = i_sp + 2*seed
                 let cand = &seq[start..start + l];
-                let tsd = detect_tsd(seq, start, end, p.min_tsd, p.max_tsd);
-                if tsd.is_empty() { continue; }
+                let tsd_len = detect_tsd(seq, start, end, p.min_tsd, p.max_tsd);
+                if tsd_len == 0 { continue; }
                 let ecand = &enc[start..start + l]; // max_indel == 0
                 let stem = if p.emit_cigar {
                     stem_cigar(ecand, p).map(|(a, c)| (a, Some(c)))
@@ -316,7 +319,7 @@ fn detect_range(end_lo: usize, end_hi: usize, gcode: &[u32], offsets: &[u32],
                 };
                 if let Some((arm, cigar)) = stem {
                     if filter_low_complex(cand, arm as usize, a2c, alpha) {
-                        out.push(Mite { start, end, arm, tsd, cigar });
+                        out.push(Mite { start, end, arm, tsd_len: tsd_len as u32, cigar });
                     }
                 }
             }
@@ -449,9 +452,12 @@ pub fn run_file(in_path: &str, out_path: &str, p: &Param) {
                 for m in &candidates[ci][j] {
                     if passes(m) {
                         // tir field: stock RLE cigar (--rle-cigar) or the integer arm length (default)
+                        // Reslice the TSD bases (= what detect_tsd matched): seq[start-len .. start].
+                        // Byte-identical to the previously stored String.
+                        let tsd = std::str::from_utf8(&seqs[ci][m.start - m.tsd_len as usize..m.start]).unwrap();
                         match &m.cigar {
-                            Some(c) => writeln!(w, ">{}:{}:{}:{}:{}", chroms[ci], m.start + 1, m.end + 1, c, m.tsd).unwrap(),
-                            None => writeln!(w, ">{}:{}:{}:{}:{}", chroms[ci], m.start + 1, m.end + 1, m.arm, m.tsd).unwrap(),
+                            Some(c) => writeln!(w, ">{}:{}:{}:{}:{}", chroms[ci], m.start + 1, m.end + 1, c, tsd).unwrap(),
+                            None => writeln!(w, ">{}:{}:{}:{}:{}", chroms[ci], m.start + 1, m.end + 1, m.arm, tsd).unwrap(),
                         }
                         writeln!(w, "{}", std::str::from_utf8(&seqs[ci][m.start..=m.end]).unwrap()).unwrap();
                     }
@@ -481,7 +487,7 @@ pub fn run_file(in_path: &str, out_path: &str, p: &Param) {
             write!(w, "],\"arm\":[").unwrap();
             for (i, m) in sel.iter().enumerate() { if i > 0 { w.write_all(b",").unwrap(); } write!(w, "{}", m.arm).unwrap(); }
             write!(w, "],\"tsd\":[").unwrap();
-            for (i, m) in sel.iter().enumerate() { if i > 0 { w.write_all(b",").unwrap(); } write!(w, "{}", m.tsd.len()).unwrap(); }
+            for (i, m) in sel.iter().enumerate() { if i > 0 { w.write_all(b",").unwrap(); } write!(w, "{}", m.tsd_len).unwrap(); }
             w.write_all(b"]}").unwrap();
         }
         w.write_all(b"}").unwrap();
@@ -575,7 +581,7 @@ fn process_fragment(seqid: &str, seq: &[u8], offset: usize, owned_len: usize, p:
             {
                 out.push((seqid.to_string(),
                           (offset + m.start + 1) as u64, (offset + m.end + 1) as u64,
-                          m.arm, m.tsd.len() as u32));
+                          m.arm, m.tsd_len));
             }
         }
     }
