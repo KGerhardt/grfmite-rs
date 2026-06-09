@@ -23,8 +23,8 @@ pub struct Param {
                           // default false = emit the integer TIR arm length (TIR-Learner use-case)
     pub threads: usize,   // -t: intra-file parallelism over the end-loop (1 = serial)
     pub legacy_fasta: bool, // --legacy-fasta: emit the old candidate.fasta (header + full
-                            // subsequence) for drop-in GRF compat. default false = emit
-                            // candidate.json (coords only; TIR-Learner reslices seq/TSD by coord)
+                            // subsequence) for drop-in GRF compat. default false = stream the
+                            // compact line format (#seqid header + "start end arm tsd_len" lines)
 }
 impl Default for Param {
     fn default() -> Self {
@@ -386,55 +386,6 @@ pub fn run_file(in_path: &str, out_path: &str, p: &Param) {
     }
     let alpha = alpha.max(1);
 
-    let nspace = (p.max_space - p.min_space + 1) as usize;
-    let mut candidates: Vec<Vec<Vec<Mite>>> = Vec::with_capacity(chroms.len());
-    for seq in &seqs {
-        let n = seq.len();
-        let seed = p.seed as usize;
-        let mut spacer_vecs: Vec<Vec<Mite>> = (0..nspace).map(|_| Vec::new()).collect();
-        if n >= (2 * p.seed + p.max_space + 2 * p.max_tsd) as usize {
-            // fcode[p] = forward 2-bit code of window [p, p+seed); INVALID if it has a non-ACGT.
-            let mut fcode: Vec<u32> = vec![INVALID; n - seed + 1];
-            for p_ in 0..=n - seed {
-                let mut val = 0u32;
-                let mut ok = true;
-                for k in 0..seed {
-                    match code(seq[p_ + k]) { Some(c) => val |= c << (2 * k), None => { ok = false; break; } }
-                }
-                if ok { fcode[p_] = val; }
-            }
-            // enc[pos] = per-base 2-bit code (ACGT->0..3) or 4 for non-ACGT; used by get_stem.
-            let enc: Vec<u8> = seq.iter().map(|&b| code(b).map(|c| c as u8).unwrap_or(4)).collect();
-            // gcode[end] = RC code of window [end-seed+1, end] = complement of each base, reversed,
-            // so field k = comp(code(seq[end-k])). INVALID for end < seed-1 or any non-ACGT.
-            let mut gcode: Vec<u32> = vec![INVALID; n];
-            for end in (seed - 1)..n {
-                let mut val = 0u32;
-                let mut ok = true;
-                for k in 0..seed {
-                    match code(seq[end - k]) { Some(c) => val |= (c ^ 0b11) << (2 * k), None => { ok = false; break; } }
-                }
-                if ok { gcode[end] = val; }
-            }
-            // CSR index: fcode value -> ascending list of start positions (seed=10 => 2^20 codes).
-            let ncode = 1usize << (2 * seed);
-            let mut offsets = vec![0u32; ncode + 1];
-            for &c in &fcode { if c != INVALID { offsets[c as usize + 1] += 1; } }
-            for i in 0..ncode { offsets[i + 1] += offsets[i]; }
-            let mut starts_by_code = vec![0u32; offsets[ncode] as usize];
-            let mut cursor = offsets.clone();
-            for (start, &c) in fcode.iter().enumerate() {
-                if c != INVALID {
-                    let cc = c as usize;
-                    starts_by_code[cursor[cc] as usize] = start as u32;
-                    cursor[cc] += 1;
-                }
-            }
-            join_detect(&gcode, &offsets, &starts_by_code, seq, &enc, &p, &mut spacer_vecs, &a2c, alpha);
-        }
-        candidates.push(spacer_vecs);
-    }
-
     // inline grf-filter (TR len + spacer len): a candidate is emitted iff this holds.
     let passes = |m: &Mite| {
         let (len1, len2) = (m.arm as i32, m.arm as i32); // no-indel: both TR lengths == arm
@@ -443,54 +394,88 @@ pub fn run_file(in_path: &str, out_path: &str, p: &Param) {
             && len2 >= p.min_stem && len2 <= p.max_stem
             && len3 >= p.min_spacer_len && len3 <= p.max_spacer_len
     };
+
+    // Streamed writeout: each end-range task serializes its PASSING candidates into a local
+    // buffer and flushes once under the writer lock, AS detection produces them. A chunk's full
+    // candidate set is never resident (peak ~ the per-seq index, not O(#candidates)). Output is
+    // UNORDERED -- TIR-Learner re-sorts (json_structure.sort_records); only the candidate
+    // multiset is contractual. Default format: one "#<seqid>" header line per sequence (seqid
+    // written ONCE, never per record), then "start end arm tsd_len" lines (1-based start/end).
+    // Legacy fasta: per-candidate header + subsequence, same as before but unordered.
     let f = File::create(out_path).expect("create out");
-    let mut w = BufWriter::new(f);
-    if p.legacy_fasta {
-        // Legacy candidate.fasta: per-candidate header + full subsequence (drop-in GRF compat).
-        for j in 0..nspace {
-            for ci in 0..chroms.len() {
-                for m in &candidates[ci][j] {
-                    if passes(m) {
-                        // tir field: stock RLE cigar (--rle-cigar) or the integer arm length (default)
-                        // Reslice the TSD bases (= what detect_tsd matched): seq[start-len .. start].
-                        // Byte-identical to the previously stored String.
-                        let tsd = std::str::from_utf8(&seqs[ci][m.start - m.tsd_len as usize..m.start]).unwrap();
-                        match &m.cigar {
-                            Some(c) => writeln!(w, ">{}:{}:{}:{}:{}", chroms[ci], m.start + 1, m.end + 1, c, tsd).unwrap(),
-                            None => writeln!(w, ">{}:{}:{}:{}:{}", chroms[ci], m.start + 1, m.end + 1, m.arm, tsd).unwrap(),
-                        }
-                        writeln!(w, "{}", std::str::from_utf8(&seqs[ci][m.start..=m.end]).unwrap()).unwrap();
+    let w = std::sync::Mutex::new(BufWriter::new(f));
+
+    for (ci, seq) in seqs.iter().enumerate() {
+        let n = seq.len();
+        let seed = p.seed as usize;
+        if !p.legacy_fasta {
+            writeln!(w.lock().unwrap(), "#{}", chroms[ci]).unwrap();
+        }
+        if n < (2 * p.seed + p.max_space + 2 * p.max_tsd) as usize { continue; }
+
+        // ---- per-sequence index (unchanged from the prior two-pass version) ----
+        // fcode[p] = forward 2-bit code of window [p, p+seed); INVALID if it has a non-ACGT.
+        let mut fcode: Vec<u32> = vec![INVALID; n - seed + 1];
+        for p_ in 0..=n - seed {
+            let mut val = 0u32; let mut ok = true;
+            for k in 0..seed { match code(seq[p_ + k]) { Some(c) => val |= c << (2 * k), None => { ok = false; break; } } }
+            if ok { fcode[p_] = val; }
+        }
+        // enc[pos] = per-base 2-bit code (ACGT->0..3) or 4 for non-ACGT; used by get_stem.
+        let enc: Vec<u8> = seq.iter().map(|&b| code(b).map(|c| c as u8).unwrap_or(4)).collect();
+        // gcode[end] = RC code of window [end-seed+1, end]. INVALID for end < seed-1 or any non-ACGT.
+        let mut gcode: Vec<u32> = vec![INVALID; n];
+        for end in (seed - 1)..n {
+            let mut val = 0u32; let mut ok = true;
+            for k in 0..seed { match code(seq[end - k]) { Some(c) => val |= (c ^ 0b11) << (2 * k), None => { ok = false; break; } } }
+            if ok { gcode[end] = val; }
+        }
+        // CSR index: fcode value -> ascending list of start positions (seed=10 => 2^20 codes).
+        let ncode = 1usize << (2 * seed);
+        let mut offsets = vec![0u32; ncode + 1];
+        for &c in &fcode { if c != INVALID { offsets[c as usize + 1] += 1; } }
+        for i in 0..ncode { offsets[i + 1] += offsets[i]; }
+        let mut starts_by_code = vec![0u32; offsets[ncode] as usize];
+        let mut cursor = offsets.clone();
+        for (start, &c) in fcode.iter().enumerate() {
+            if c != INVALID { let cc = c as usize; starts_by_code[cursor[cc] as usize] = start as u32; cursor[cc] += 1; }
+        }
+
+        // serialize one end-range's passers into a buffer, then flush once under the lock.
+        let emit = |mites: Vec<Mite>| {
+            let mut buf: Vec<u8> = Vec::new();
+            for m in &mites {
+                if !passes(m) { continue; }
+                if p.legacy_fasta {
+                    // Reslice TSD (= detect_tsd's match) and element from seq -> byte-identical bytes.
+                    let tsd = std::str::from_utf8(&seq[m.start - m.tsd_len as usize..m.start]).unwrap();
+                    let elem = std::str::from_utf8(&seq[m.start..=m.end]).unwrap();
+                    match &m.cigar {
+                        Some(c) => writeln!(buf, ">{}:{}:{}:{}:{}\n{}", chroms[ci], m.start + 1, m.end + 1, c, tsd, elem).unwrap(),
+                        None => writeln!(buf, ">{}:{}:{}:{}:{}\n{}", chroms[ci], m.start + 1, m.end + 1, m.arm, tsd, elem).unwrap(),
                     }
+                } else {
+                    writeln!(buf, "{} {} {} {}", m.start + 1, m.end + 1, m.arm, m.tsd_len).unwrap();
                 }
             }
+            if !buf.is_empty() { w.lock().unwrap().write_all(&buf).unwrap(); }
+        };
+
+        // Drive detect_range over the contig, serial or rayon over fixed end-chunks (mirrors the
+        // old join_detect split), flushing each range's passers instead of collecting them.
+        let min_off2 = (p.min_space + 2 * p.seed - 1) as usize;
+        let total = n.saturating_sub(min_off2);
+        const CHUNK: usize = 16384;
+        if p.threads <= 1 || total <= CHUNK {
+            emit(detect_range(min_off2, n, &gcode, &offsets, &starts_by_code, seq, &enc, p, &a2c, alpha));
+        } else {
+            let nchunks = total.div_ceil(CHUNK);
+            (0..nchunks).into_par_iter().for_each(|cidx| {
+                let lo = min_off2 + cidx * CHUNK;
+                let hi = (lo + CHUNK).min(n);
+                emit(detect_range(lo, hi, &gcode, &offsets, &starts_by_code, seq, &enc, p, &a2c, alpha));
+            });
         }
-    } else {
-        // Default candidate.json: chrom-keyed columnar coordinates, no sequence. All integers:
-        // start/end (1-based inclusive), arm (TIR-arm length), tsd (TSD size). TIR-Learner reslices
-        // the element sequence and TSD bases from the chunk fasta by these coordinates.
-        write!(w, "{{").unwrap();
-        let mut first_chrom = true;
-        for ci in 0..chroms.len() {
-            let mut sel: Vec<&Mite> = Vec::new();
-            for j in 0..nspace {
-                for m in &candidates[ci][j] {
-                    if passes(m) { sel.push(m); }
-                }
-            }
-            if sel.is_empty() { continue; }
-            if !first_chrom { w.write_all(b",").unwrap(); }
-            first_chrom = false;
-            write!(w, "\"{}\":{{\"start\":[", chroms[ci]).unwrap();
-            for (i, m) in sel.iter().enumerate() { if i > 0 { w.write_all(b",").unwrap(); } write!(w, "{}", m.start + 1).unwrap(); }
-            write!(w, "],\"end\":[").unwrap();
-            for (i, m) in sel.iter().enumerate() { if i > 0 { w.write_all(b",").unwrap(); } write!(w, "{}", m.end + 1).unwrap(); }
-            write!(w, "],\"arm\":[").unwrap();
-            for (i, m) in sel.iter().enumerate() { if i > 0 { w.write_all(b",").unwrap(); } write!(w, "{}", m.arm).unwrap(); }
-            write!(w, "],\"tsd\":[").unwrap();
-            for (i, m) in sel.iter().enumerate() { if i > 0 { w.write_all(b",").unwrap(); } write!(w, "{}", m.tsd_len).unwrap(); }
-            w.write_all(b"]}").unwrap();
-        }
-        w.write_all(b"}").unwrap();
     }
 }
 
@@ -501,7 +486,7 @@ pub fn set_threads(threads: usize) {
 
 // CLI --batch: outer par_iter over files + join_detect's inner chunk par_iter share one pool
 // -> single global work-stealing pool (bulk = inter-file, tail = intra-file). Writes
-// One flat file per input: <outdir>/<basename>.json (or <basename>.candidate.fasta for
+// One flat file per input: <outdir>/<basename>.grf.txt (or <basename>.candidate.fasta for
 // --legacy-fasta). No per-chunk directory, so batch output costs N inodes, not 2N — meaningful
 // on HPC shared filesystems with file-count quotas. Returns elapsed seconds.
 pub fn run_batch(paths: &[String], outdir: &str, p: &Param) -> f64 {
@@ -512,7 +497,7 @@ pub fn run_batch(paths: &[String], outdir: &str, p: &Param) -> f64 {
         let out_path = if p.legacy_fasta {
             format!("{}/{}.candidate.fasta", outdir, base)
         } else {
-            format!("{}/{}.json", outdir, base)
+            format!("{}/{}.grf.txt", outdir, base)
         };
         run_file(ip, &out_path, p);
     });

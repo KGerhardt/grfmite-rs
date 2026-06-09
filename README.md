@@ -74,14 +74,15 @@ The binary is named `grf_rs` (the conda package also installs a `grfmite-rs` ali
 
 ## Usage
 
-Single FASTA (writes `<outdir>/candidate.fasta`):
+Single FASTA (writes `<outdir>/candidate.grf.txt`):
 
 ```shell
 grf_rs -i genome.fa -o outdir -c 1 -p 20 --min_space 10 --max_space 5000 \
   --max_indel 0 --min_tr 10 --min_spacer_len 10 --max_spacer_len 5000 -t 8
 ```
 
-Batch — one work-stealing pool over many chunks (writes `<outdir>/<file_stem>/candidate.fasta`):
+Batch — one work-stealing pool over many chunks (writes `<outdir>/<file_stem>.grf.txt`, one flat
+file per input):
 
 ```shell
 grf_rs --batch list_of_fasta_paths.txt -o outdir -t 16 -c 1 -p 20 \
@@ -91,12 +92,17 @@ grf_rs --batch list_of_fasta_paths.txt -o outdir -t 16 -c 1 -p 20 \
 
 ### Output modes
 
-- **default** — the cigar field of each candidate header is the integer TIR arm length
-  (what TIR-Learner consumes). TIR-Learner-equivalent to stock GRF.
-- **`--rle-cigar`** — emits the stock GRF run-length `m`/`M` cigar string, byte-identical to
-  upstream `grf-main` (for general / non-TIR-Learner use).
-
-Header format (1-based, inclusive): `>seqid:start:stop:<cigar|tir_len>:tsd`.
+- **default** (`*.grf.txt`) — a compact, **streamed** line format: one `#<seqid>` header line per
+  sequence (the seqid is written once, not per record), then one `start end arm tsd_len` record
+  per candidate (1-based inclusive start/end; `arm` = integer TIR arm length; `tsd_len` = TSD
+  size). Candidates are written as detection produces them, so a chunk's full candidate set is
+  never resident — peak RAM tracks the index, not candidate count. **Records are unordered**; the
+  consumer (TIR-Learner) re-sorts. As of **v0.3.0** this replaces the previous columnar JSON.
+- **`--legacy-fasta`** (`*.candidate.fasta`) — the per-candidate fasta GRF emits: header
+  `>seqid:start:stop:<tir_len|cigar>:tsd` followed by the full element subsequence. Drop-in GRF
+  compatibility (also unordered as of v0.3.0).
+- **`--rle-cigar`** — with `--legacy-fasta`, emit the stock GRF run-length `m`/`M` cigar string
+  (byte-identical content to upstream `grf-main`) in place of the integer arm length.
 
 ## License
 

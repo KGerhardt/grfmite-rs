@@ -46,7 +46,7 @@ fn main() {
             eprintln!("[batch] files={} threads={} wall={:.1}s", paths.len(), p.threads, secs);
         }
         None => {
-            let fname = if p.legacy_fasta { "candidate.fasta" } else { "candidate.json" };
+            let fname = if p.legacy_fasta { "candidate.fasta" } else { "candidate.grf.txt" };
             run_file(&input, &format!("{}/{}", outdir, fname), &p);
         }
     }
