@@ -1,8 +1,8 @@
 # grfmite-rs vs stock GRF — algorithmic change log
 
 This documents how grfmite-rs differs from stock GRF's MITE detection (`grf-main -c 1`,
-tested against `genericrepeatfinder` 1.0.2). It is a **clean-room reimplementation**: it
-produces equivalent results (byte-identical via `--rle-cigar`, see `test/byte_identity_test.sh`)
+tested against `genericrepeatfinder` 1.0.2). It produces equivalent results (byte-identical via 
+`--rle-cigar`, see `test/byte_identity_test.sh`)
 but shares no source with upstream GRF. Scope is the `-c 1` MITE path only.
 
 Each entry: **Description** (what GRF does) · **Rationale** (why change it) ·
